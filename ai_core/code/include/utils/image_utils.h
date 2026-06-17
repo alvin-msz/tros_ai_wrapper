@@ -108,7 +108,7 @@ int draw_rect(cv::Mat &mat, std::vector<std::vector<float>> corner,
  */
 int draw_bev_bbox(cv::Mat &mat,
                   std::vector<std::vector<std::vector<float>>> &corner_bbox,
-                  int thickness = 1, float resize_ratio = 1.0);
+                  int thickness = 1);
 
 /**
  * Get 3d bbox corner.
@@ -263,15 +263,18 @@ void draw_segment(ImageTensor *frame, Parsing<T> &segs, cv::Mat &mat) {
   int height = segs.height;
 
   cv::Mat seg_img(height, width, CV_8UC3);
-  uint8_t *seg_img_ptr = seg_img.ptr<uint8_t>();
+  seg_img.setTo(cv::Scalar(0, 0, 0));
 
   for (int h = 0; h < height; ++h) {
     for (int w = 0; w < width; ++w) {
-      int8_t id = static_cast<int8_t>(result_ptr[h * width + w]);
-      if (id >= 19) continue;
-      *seg_img_ptr++ = bgr_putpalette[id * 3];
-      *seg_img_ptr++ = bgr_putpalette[id * 3 + 1];
-      *seg_img_ptr++ = bgr_putpalette[id * 3 + 2];
+      int id = static_cast<int>(result_ptr[h * width + w]);
+      if (id < 0 || id >= 19) {
+        id = 0;
+      }
+      auto &pix = seg_img.at<cv::Vec3b>(h, w);
+      pix[0] = bgr_putpalette[id * 3];
+      pix[1] = bgr_putpalette[id * 3 + 1];
+      pix[2] = bgr_putpalette[id * 3 + 2];
     }
   }
 

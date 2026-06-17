@@ -11,6 +11,8 @@
 #include <fstream>
 #include <iostream>
 #include <string>
+#include <sys/stat.h>
+#include <map>
 
 #include "glog/logging.h"
 #include "utils/data_transformer.h"
@@ -170,7 +172,7 @@ void draw_bev_detection_mul_imgs(
     auto y_addr =
         reinterpret_cast<uint8_t *>(data_buffer);  // + (y_size + uv_size);
     auto uv_addr = y_addr + y_size;
-    VLOG(EXAMPLE_DETAIL) << "draw_bev_detection:" << height << "x" << stride
+    VLOG(EXAMPLE_REPORT) << "draw_bev_detection:" << height << " x" << stride
                          << ", length: " << data_length;
     auto dst_addr = out_image.data;
     memcpy(dst_addr, y_addr, y_size);
@@ -300,7 +302,7 @@ void draw_lidar3d(ImageTensor *frame, std::vector<LidarDetection3D> &dets,
     float w = dets[i].bbox.dim_0;
     float h = dets[i].bbox.dim_1;
     float p = dets[i].bbox.dim_2;
-    float angle = dets[i].bbox.rot;
+    float angle = -dets[i].bbox.rot;
 
     float rot_sin = std::sin(angle);
     float rot_cos = std::cos(angle);
@@ -388,8 +390,20 @@ void draw_lidar3d(ImageTensor *frame, std::vector<LidarDetection3D> &dets,
   // 1. read point
   int32_t data_length = 0;
   char *data_buffer = nullptr;
-  auto ret =
-      read_binary_file(frame->ori_image_path, &data_buffer, &data_length);
+  std::string lidar_path = frame->ori_image_path;
+  struct stat st {};
+  if (!lidar_path.empty() && stat(lidar_path.c_str(), &st) == 0 &&
+      S_ISDIR(st.st_mode)) {
+    lidar_path += "/lidar_points.bin";
+  }
+  auto ret = read_binary_file(lidar_path, &data_buffer, &data_length);
+  if (ret != 0 || data_buffer == nullptr || data_length <= 0 ||
+      (data_length % static_cast<int>(sizeof(float)) != 0)) {
+    VLOG(EXAMPLE_SYSTEM) << "draw_lidar3d: invalid lidar points input path "
+                         << lidar_path << ", length " << data_length;
+    mat = cv::Mat(800, 800, CV_8UC3, cv::Scalar(255, 255, 255));
+    return;
+  }
   int element_size = data_length / 4;
   std::vector<float> padding_points(element_size);
   memcpy(padding_points.data(), data_buffer, data_length);
@@ -401,6 +415,11 @@ void draw_lidar3d(ImageTensor *frame, std::vector<LidarDetection3D> &dets,
   for (int i = 0; i < point_num; ++i) {
     points_y.push_back(padding_points[i * 5 + 1]);
     points_x.push_back(-1 * padding_points[i * 5 + 0]);
+  }
+  if (points_x.empty() || points_y.empty()) {
+    delete[] data_buffer;
+    mat = cv::Mat(800, 800, CV_8UC3, cv::Scalar(255, 255, 255));
+    return;
   }
 
   // 3. min_width, max_width
@@ -487,7 +506,7 @@ void draw_lidar3d(ImageTensor *frame, std::vector<LidarDetection3D> &dets,
 
     // direction
     float length = 4;
-    float axis_rot = 0.5 * 3.141592653589793;
+    float axis_rot = 0; // 0.5 * 3.141592653589793;
     std::vector<float> box_xy(box.begin(), box.begin() + 8);
     float x0 = -(box_xy[0] + box_xy[2] + box_xy[4] + box_xy[6]) / 4.0;
     float y0 = (box_xy[1] + box_xy[3] + box_xy[5] + box_xy[7]) / 4.0;
@@ -515,29 +534,7 @@ void draw_lidar3d(ImageTensor *frame, std::vector<LidarDetection3D> &dets,
                 cv::LINE_AA);
   }
   delete[] data_buffer;
-  // mat = std::move(image);
-  
-  // affine处理，固定画布大小，并将自车移动到画布最中间位置
-  static int PUBIMAGE_WIDTH = 1920;
-  static int PUBIMAGE_HEIGHT = 1440;
-  mat = cv::Mat(PUBIMAGE_HEIGHT, PUBIMAGE_WIDTH, mat.type());
-  // 获取自车坐标
-  int selfCar_point_x = width_offset * width_resize;
-  int selfCar_point_y = (height - height_offset) * height_resize;
-  
-  // 画布大小默认为1920 * 1440 ，需要将自车移动到画布最中间位置
-  int centerpoint_x = PUBIMAGE_WIDTH/2;
-  int centerpoint_y = PUBIMAGE_HEIGHT/2;
-  int offset_x = centerpoint_x - selfCar_point_x;
-  int offset_y = centerpoint_y - selfCar_point_y;
-  cv::Scalar colorborder(255, 255, 255); // 白色填充
-  cv::Mat warp_matrix = (cv::Mat_<float>(2, 3) <<
-        cos(0), -sin(0), offset_x,
-        sin(0), cos(0), offset_y);
-  cv::warpAffine(image, mat, warp_matrix, mat.size(), cv::INTER_LINEAR, cv::BORDER_CONSTANT, colorborder);
-
-  // 输出图像尺寸
-  VLOG(EXAMPLE_DEBUG) << "mat.size(): " << mat.size();
+  mat = std::move(image);
 }
 
 int draw_perception(ImageTensor *frame, Perception *perception, cv::Mat &mat) {
@@ -550,10 +547,6 @@ int draw_perception(ImageTensor *frame, Perception *perception, cv::Mat &mat) {
       mat = cv::imread(frame->ori_image_path);
     }
   }
-
-  VLOG(EXAMPLE_DEBUG) << "perception type: " << perception->type
-    << ", DET3D: " << Perception::DET3D
-    << ", LIDAR3D: " << Perception::LIDAR3D;
 
   if (perception->type == Perception::DET) {
     auto &det = perception->det;
@@ -1232,7 +1225,7 @@ int draw_rect(cv::Mat &mat, std::vector<std::vector<float>> corner,
 
 int draw_bev_bbox(cv::Mat &mat,
                   std::vector<std::vector<std::vector<float>>> &corner_bbox,
-                  int thickness, float resize_ratio) {
+                  int thickness) {
   for (auto &bbox : corner_bbox) {
     if (bbox.size() != 3 && bbox[0].size() != 8) {
       VLOG(EXAMPLE_SYSTEM) << "corner size error";
@@ -1243,28 +1236,28 @@ int draw_bev_bbox(cv::Mat &mat,
     std::vector<std::vector<float>> rect2(2, std::vector<float>(4, 0.f));
 
     for (int i = 0; i < 4; i++) {
-      cv::Point point0{static_cast<int>(bbox[0][i]) * resize_ratio,
-                       static_cast<int>(bbox[1][i]) * resize_ratio};
-      cv::Point point1{static_cast<int>(bbox[0][i + 4] * resize_ratio),
-                       static_cast<int>(bbox[1][i + 4] * resize_ratio)};
+      cv::Point point0{static_cast<int>(bbox[0][i]),
+                       static_cast<int>(bbox[1][i])};
+      cv::Point point1{static_cast<int>(bbox[0][i + 4]),
+                       static_cast<int>(bbox[1][i + 4])};
       cv::line(mat, point0, point1, cv::Scalar(0, 0, 0), thickness);
 
-      rect1[0][i] = bbox[0][i] * resize_ratio;
-      rect1[1][i] = bbox[1][i] * resize_ratio;
-      rect2[0][i] = bbox[0][i + 4] * resize_ratio;
-      rect2[1][i] = bbox[1][i + 4] * resize_ratio;
+      rect1[0][i] = bbox[0][i];
+      rect1[1][i] = bbox[1][i];
+      rect2[0][i] = bbox[0][i + 4];
+      rect2[1][i] = bbox[1][i + 4];
     }
     draw_rect(mat, rect1, cv::Scalar(255, 0, 0), thickness);
     draw_rect(mat, rect2, cv::Scalar(0, 0, 255), thickness);
 
     int center_bottom_forward_x =
-        static_cast<int>((bbox[0][2] + bbox[0][3]) / 2 * resize_ratio);
+        static_cast<int>((bbox[0][2] + bbox[0][3]) / 2);
     int center_bottom_forward_y =
-        static_cast<int>((bbox[1][2] + bbox[1][3]) / 2 * resize_ratio);
+        static_cast<int>((bbox[1][2] + bbox[1][3]) / 2);
     int center_bottom_x = static_cast<int>(
-        (bbox[0][2] + bbox[0][3] + bbox[0][6] + bbox[0][7]) / 4 * resize_ratio);
+        (bbox[0][2] + bbox[0][3] + bbox[0][6] + bbox[0][7]) / 4);
     int center_bottom_y = static_cast<int>(
-        (bbox[1][2] + bbox[1][3] + bbox[1][6] + bbox[1][7]) / 4 * resize_ratio);
+        (bbox[1][2] + bbox[1][3] + bbox[1][6] + bbox[1][7]) / 4);
     cv::Point point0{center_bottom_forward_x, center_bottom_forward_y};
     cv::Point point1{center_bottom_x, center_bottom_y};
     cv::line(mat, point0, point1, cv::Scalar(255, 0, 0), thickness);
@@ -1273,24 +1266,24 @@ int draw_bev_bbox(cv::Mat &mat,
 }
 
 const std::vector<cv::Vec4b> colors_map = {
-    cv::Vec4b(0, 0, 0, 255),        // 0 undefined
-    cv::Vec4b(112, 128, 144, 255),  // 1 car orange
-    cv::Vec4b(220, 20, 60, 255),    // 2 pedestrian Blue
-    cv::Vec4b(255, 127, 80, 255),   // 3 sign Darkslategrey
-    cv::Vec4b(255, 158, 0, 255),    // 4 CYCLIST Crimson
-    cv::Vec4b(233, 150, 70, 255),   // 5 traffic_light Orangered
-    cv::Vec4b(255, 61, 99, 255),    // 6 pole Darkorange
-    cv::Vec4b(0, 0, 230, 255),      // 7 construction_cone Darksalmon
-    cv::Vec4b(47, 79, 79, 255),     // 8 bicycle Red
-    cv::Vec4b(255, 140, 0, 255),    // 9 motorcycle Slategrey
-    cv::Vec4b(255, 99, 71, 255),    // 10 building Burlywood
-    cv::Vec4b(0, 207, 191, 255),    // 11 vegetation Green
-    cv::Vec4b(175, 0, 75, 255),     // 12 trunk nuTonomy green
-    cv::Vec4b(75, 0, 75, 255),      // 13 curb, road, lane_marker, other_ground
-    cv::Vec4b(112, 180, 60, 255),   // 14 walkable, sidewalk
-    cv::Vec4b(222, 184, 135, 255),  // 15 unobserved
-    cv::Vec4b(0, 175, 0, 255),      // 16 undefined
-    cv::Vec4b(0, 0, 0, 255)         // 17 undefined
+    cv::Vec4b(0,   0,   0,   255),  // 0  others
+    cv::Vec4b(255, 120,  50, 255),  // 1  barrier
+    cv::Vec4b(255, 192, 203, 255),  // 2  bicycle
+    cv::Vec4b(255, 255,   0, 255),  // 3  bus
+    cv::Vec4b(0,   150, 245, 255),  // 4  car
+    cv::Vec4b(0,   255, 255, 255),  // 5  construction_vehicle
+    cv::Vec4b(200, 180,   0, 255),  // 6  motorcycle
+    cv::Vec4b(255,   0,   0, 255),  // 7  pedestrian
+    cv::Vec4b(255, 240, 150, 255),  // 8  traffic_cone
+    cv::Vec4b(135,  60,   0, 255),  // 9  trailer
+    cv::Vec4b(160,  32, 240, 255),  // 10 truck
+    cv::Vec4b(255,   0, 255, 255),  // 11 driveable_surface
+    cv::Vec4b(175,   0,  75, 255),  // 12 other_flat
+    cv::Vec4b(75,    0,  75, 255),  // 13 sidewalk
+    cv::Vec4b(150, 240,  80, 255),  // 14 terrain
+    cv::Vec4b(230, 230, 250, 255),  // 15 manmade
+    cv::Vec4b(0,   175,   0, 255),  // 16 vegetation
+    cv::Vec4b(255, 255, 255, 255)   // 17 free
 };
 
 int draw_2d_occ(Parsing3d<uint32_t> &seg3d, cv::Mat &occ_bev_resized,
@@ -1298,36 +1291,32 @@ int draw_2d_occ(Parsing3d<uint32_t> &seg3d, cv::Mat &occ_bev_resized,
   int32_t height = seg3d.h;
   int32_t width = seg3d.w;
   int32_t channels = seg3d.z;
-  std::vector<uint32_t> flat_semantics = seg3d.seg;
-  cv::Mat occ_bev(height, width, CV_8UC3, cv::Scalar(0, 0, 0));
+  const std::vector<uint32_t> &flat_semantics = seg3d.seg;
+  const uint32_t free_id = static_cast<uint32_t>(colors_map.size()) - 1; // 17
+  cv::Mat occ_bev(height, width, CV_8UC3, cv::Scalar(255, 255, 255));
 
   for (int h = 0; h < height; h++) {
     for (int w = 0; w < width; w++) {
       int base_idx = (h * width + w) * channels;
 
-      bool has_valid = false;
-      int max_idx = 0;
-      float max_val = -1.0f;
-
+      // Align with Python: last non-free layer wins
+      uint32_t best_cls = free_id;
       for (int c = 0; c < channels; c++) {
-        float val = flat_semantics[base_idx + c];
-        if (val > max_val && val != 17) {
-          max_val = val;
-          max_idx = c;
-          has_valid = true;
+        uint32_t cls = flat_semantics[base_idx + c];
+        if (cls != free_id) {
+          best_cls = cls;
         }
       }
 
-      if (has_valid) {
-        int color_idx = static_cast<int>(flat_semantics[base_idx + max_idx]);
-        if (color_idx >= 0 && color_idx < colors_map.size()) {
-          cv::Vec4b color = colors_map[color_idx];
-          occ_bev.at<cv::Vec3b>(h, w) = cv::Vec3b(color[0], color[1], color[2]);
-        }
+      if (best_cls < static_cast<uint32_t>(colors_map.size())) {
+        cv::Vec4b color = colors_map[best_cls];
+        occ_bev.at<cv::Vec3b>(h, w) = cv::Vec3b(color[0], color[1], color[2]);
       }
     }
   }
-  cv::resize(occ_bev, occ_bev_resized, cv::Size(400, 400));
+  // 按比例缩放而非固定 400x400
+  int scale = std::max(1, 400 / std::max(height, width));
+  cv::resize(occ_bev, occ_bev_resized, cv::Size(width * scale, height * scale), 0, 0, cv::INTER_NEAREST);
 
   if (reverse_rgb) {
     cv::Mat temp;

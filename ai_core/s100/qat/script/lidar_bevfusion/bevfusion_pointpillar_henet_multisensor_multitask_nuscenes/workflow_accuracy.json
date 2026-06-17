@@ -1,0 +1,53 @@
+{
+  "input_config": {
+    "input_type": "raw_data",
+    "preprocess": {
+      "method_type": "QATBevFusionMultiSensorPreProcessMethod",
+      "unique_name": "QATBevFusionMultiSensorPreProcessMethod",
+      "method_config": "../../config/preprocess/bevfusion_pointpillar_multisensor_preprocess.json"
+    },
+    "image_list_file": "../../../mini_data/bevfusion_pointpillar_henet_multisensor_multitask_nuscenes/frames.lst",
+    "need_pre_load": false,
+    "limit": 12,
+    "need_loop": false,
+    "max_cache": 10
+  },
+  "output_config": {
+    "output_type": "eval",
+    "eval_enable": true,
+    "multitask_output_file": [
+      "./det_eval.log",
+      "./seg_eval.log"
+    ]
+  },
+  "workflow": [
+    {
+      "method_type": "InferMethod",
+      "unique_name": "InferMethod",
+      "method_config": {
+        "core": 0,
+        "model_file": "../../../model/runtime/bevfusion_pointpillar_henet_multisensor_multitask_nuscenes/compile/model.hbm"
+      }
+    },
+    {
+      "thread_count": 8,
+      "method_type": "QATBevFusionMultitaskPostProcessMethod",
+      "unique_name": "QATBevFusionMultitaskPostProcessMethod",
+      "method_config": {
+        "topk": 300,
+        "score_threshold": 0.1,
+        "det_output_base": 0,
+        "occ_tensor_idx": 4,
+        "occ_resize_height": 512,
+        "occ_resize_width": 512,
+        "occ_scale_height": 0,
+        "occ_scale_width": 0,
+        "occ_use_int32": false,
+        "bev_range": [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0],
+        "post_center_range": [-61.2, -61.2, -10.0, 61.2, 61.2, 10.0],
+        "ori_shape": [900, 1600],
+        "resize_shape": [512, 960]
+      }
+    }
+  ]
+}

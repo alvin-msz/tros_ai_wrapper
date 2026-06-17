@@ -60,9 +60,15 @@ void ImageListOutputModule::Write(ImageTensor *frame, Perception *perception) {
       cv::imwrite(det_name, det_mat);
 
       cv::Mat seg_mat;
-      Parsing<uint8_t> segs = perception->lidarSeg;
       std::string seg_name = ss.str() + "_seg.png";
-      draw_segment(frame, segs, seg_mat);
+      if (!perception->seg3d.seg.empty() && perception->seg3d.h > 0 &&
+          perception->seg3d.w > 0 && perception->seg3d.z > 0) {
+        bool reverse_rgb = true;
+        draw_2d_occ(perception->seg3d, seg_mat, reverse_rgb);
+      } else {
+        Parsing<uint8_t> segs = perception->lidarSeg;
+        draw_segment(frame, segs, seg_mat);
+      }
       cv::imwrite(seg_name, seg_mat);
 
     } else if (perception->type == Perception::BEV) {
@@ -74,8 +80,6 @@ void ImageListOutputModule::Write(ImageTensor *frame, Perception *perception) {
       std::string token = frame->image_name.substr(0, pos);
       if (bev_scenes_info_.HasMember(token.c_str())) {
         std::string scene = bev_scenes_info_[token.c_str()].GetString();
-        VLOG(EXAMPLE_DETAIL) << "get scene [" << scene << "] with token ["
-          << token << "] in image_name [" << frame->image_name << "]";
         std::vector<std::vector<std::vector<float>>> ego2img;
         if (scene == "boston-seaport") {
           get_ego2img(ego2img, boston, 900, 1600, frame->resize_height,
@@ -93,18 +97,8 @@ void ImageListOutputModule::Write(ImageTensor *frame, Perception *perception) {
         } else {
           draw_bev_detection(frame, perception->bevDet3d, img, ego2img);
         }
-        if (save_flag_) {
-          for (int i = 0; i < 6; i++) {
-            cv::imwrite(ss.str() + cam_names[i] + "_det.png", img[i]);
-            
-            std::string cmd = "mkdir -p raw_render/" + cam_names[i];
-            int result = system(cmd.c_str());
-            if (result != 0) {
-              VLOG(EXAMPLE_SYSTEM) << "Do cmd: " << cmd << " failed";
-            } else {
-              cv::imwrite("raw_render/" + cam_names[i] + "/" + std::to_string(frame->frame_id) + ".png", img[i]);
-            }
-          }
+        for (int i = 0; i < 6; i++) {
+          cv::imwrite(ss.str() + cam_names[i] + "_det.png", img[i]);
         }
 
         if (!perception->bevSeg.seg.empty()) {
@@ -115,50 +109,23 @@ void ImageListOutputModule::Write(ImageTensor *frame, Perception *perception) {
           std::vector<int> labels;
           bbox_to_corner(corner_bbox, scores, labels, bev_bbox);
           float bev_size[3] = {51.2, 51.2, 0.8};
-          float resize_ratio = 7.5;
-          int height = static_cast<int>(bev_size[0] * 2 / bev_size[2]) * resize_ratio;
-          int width = static_cast<int>(bev_size[1] * 2 / bev_size[2]) * resize_ratio;
+          int height = static_cast<int>(bev_size[0] * 2 / bev_size[2]);
+          int width = static_cast<int>(bev_size[1] * 2 / bev_size[2]);
           cv::Mat bev_mat(height, width, CV_8UC3);
           bev_mat.setTo(cv::Scalar(255, 255, 255));
-          draw_bev_bbox(bev_mat, corner_bbox, 4, resize_ratio);
-          if (save_flag_) {
-            std::string bev_name = ss.str() + "_bev.png";
-            cv::imwrite(bev_name, bev_mat);
-            
-            std::string cmd = "mkdir -p raw_render/BEV";
-            int result = system(cmd.c_str());
-            if (result != 0) {
-              VLOG(EXAMPLE_SYSTEM) << "Do cmd: " << cmd << " failed";
-            } else {
-              cv::imwrite("raw_render/BEV/" + std::to_string(frame->frame_id) + ".png", bev_mat);
-            }
-          }
+          draw_bev_bbox(bev_mat, corner_bbox, 1);
+          std::string bev_name = ss.str() + "_bev.png";
+          cv::imwrite(bev_name, bev_mat);
 
           cv::Mat seg_mat;
           Parsing<uint32_t> segs = perception->bevSeg;
           std::string seg_name = ss.str() + "_seg.png";
           draw_bev_segment(frame, segs, color_map_, seg_mat);
-          if (save_flag_) {
-            cv::imwrite(seg_name, seg_mat);
-            std::string cmd = "mkdir -p raw_render/SEG";
-            int result = system(cmd.c_str());
-            if (result != 0) {
-              VLOG(EXAMPLE_SYSTEM) << "Do cmd: " << cmd << " failed";
-            } else {
-              cv::imwrite("raw_render/SEG/" + std::to_string(frame->frame_id) + ".png", seg_mat);
-            }
-          }
-
-          if (get_render_imgs_func_) {
-            img.push_back(bev_mat);
-            img.push_back(seg_mat);
-            get_render_imgs_func_(img, frame, perception);
-          }
+          cv::imwrite(seg_name, seg_mat);
         }
 
       } else {
         VLOG(EXAMPLE_SYSTEM) << "input file error, given file: " << token;
-        VLOG(EXAMPLE_SYSTEM) << "get scene failed with token [" << token << "] in image_name [" << frame->image_name << "]";
       }
 
     } else if (perception->type == Perception::TRAJPRED) {
@@ -425,16 +392,8 @@ void ImageListOutputModule::Write(ImageTensor *frame, Perception *perception) {
             perception->type == Perception::LIDAR3D) {
           ss << ".png";
         }
-        if (get_render_imgs_func_) {
-          std::vector<cv::Mat> imgs;
-          imgs.push_back(mat);
-          get_render_imgs_func_(imgs, frame, perception);
-        }
-        if (save_flag_) {
-          // 输出文件名
-          VLOG(EXAMPLE_SYSTEM) << "save file: " << ss.str();
-          cv::imwrite(ss.str(), mat);
-        }
+
+        cv::imwrite(ss.str(), mat);
       }
     }
     image_counter_++;
@@ -453,12 +412,6 @@ int ImageListOutputModule::LoadConfig(std::string &config_string) {
   if (document.HasMember("enable_view_output")) {
     output_flag_ = document["enable_view_output"].GetBool();
   }
-
-  if (document.HasMember("enable_save_output")) {
-    save_flag_ = document["enable_save_output"].GetBool();
-  }
-
-  VLOG(EXAMPLE_SYSTEM) << "save_flag: " << save_flag_;
 
   if (document.HasMember("view_output_dir")) {
     image_output_dir_ = document["view_output_dir"].GetString();

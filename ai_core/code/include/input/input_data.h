@@ -31,6 +31,8 @@ typedef struct ImageTensor {
   int input_height;
   std::string ori_image_path;
   uint64_t pre_duration{0U};
+  /** Inference time (us) for the current frame, filled before postprocess runs. */
+  uint64_t infer_duration{0U};
   int32_t frames_per_sample_infer{
       0};  // Number of frames for single sample inference
 

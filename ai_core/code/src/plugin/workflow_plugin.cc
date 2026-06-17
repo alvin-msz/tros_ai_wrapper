@@ -27,6 +27,12 @@ int WorkflowPlugin::Init(const std::string& config_file,
   auto pp_type = array[1]["method_type"].GetString();
   auto thread_count = array[1]["thread_count"].GetInt();
 
+  if (array[0].HasMember("open_lru") && array[0]["open_lru"].GetBool()) {
+    setenv("HB_NN_ENABLE_MEM_LRU_CACHE", "true", 1);
+  } else {
+    setenv("HB_NN_ENABLE_MEM_LRU_CACHE", "false", 1);
+  }
+
   std::string method_config_tmp = json_to_string(array[0]["method_config"]);
   rapidjson::Document document_method_config;
   document_method_config.Parse(method_config_tmp.data());
@@ -185,6 +191,9 @@ int WorkflowPlugin::Init(const std::string& config_file,
           "hbUCPMallocCached failed");
       auto& mem = temporal_tensor_[0][k].sysMem;
       memset(mem.virAddr, 0, aligned_size);
+      mem.memSize = aligned_size;
+      hbUCPMemFlush(&(mem),
+                    HB_SYS_MEM_CACHE_CLEAN);
     }
     // init agent encoder --> temporal_tensor_[1][0~5]
     temporal_tensor_[1].resize(steps_to_decode_);
@@ -199,6 +208,9 @@ int WorkflowPlugin::Init(const std::string& config_file,
           "hbUCPMallocCached failed");
       auto& mem = temporal_tensor_[1][k].sysMem;
       memset(mem.virAddr, 0, aligned_size);
+      mem.memSize = aligned_size;
+      hbUCPMemFlush(&(mem),
+                    HB_SYS_MEM_CACHE_CLEAN);
     }
   }
   VLOG(EXAMPLE_DETAIL) << "WorkflowPlugin inited.";
@@ -233,9 +245,12 @@ void WorkflowPlugin::Run(int instance_id) {
     }
     auto start = Stopwatch::CurrentTs();
     auto output_tensors = infer_method->DoProcess(image_tensor.get());
+    LOG_IF(FATAL, output_tensors == nullptr) << "Infer method failed";
     auto end = Stopwatch::CurrentTs();
     auto infer_duration = end - start;
+    image_tensor->infer_duration = infer_duration;
     auto perception = pp_method->DoProcess(image_tensor.get(), output_tensors);
+    LOG_IF(FATAL, perception == nullptr) << "Postprocess method failed";
     auto pp_duration = Stopwatch::CurrentTs() - end;
     perception->infer_duration = infer_duration;
     perception->pp_duration = pp_duration;
@@ -647,6 +662,7 @@ void WorkflowPlugin::GetTemporalAgentEnc(std::vector<hbDNNTensor>& tensor,
     VLOG(EXAMPLE_DETAIL) << "  GetTemporalUpdateStatus False "
                          << GetTemporalUpdateStatus(idx);
   }
+  flush_tensor(&tensor[tensor_idx]);
   is_temporal_update_[tem_enc_idx] = false;
 }
 template <typename T>

@@ -1,0 +1,40 @@
+sequenceDiagram
+    participant main as simple_example.cc<br/>(main)
+    participant WP as WorkflowPlugin<br/>(Singleton)
+    participant MF as MethodFactory<br/>(Singleton)
+    participant IM as InferMethod
+    participant PM as QATCenterPointPostProcessMethod
+    participant IP as InputProducerPlugin
+    participant RDI as RawDataIterator
+
+    Note over MF: 程序启动时，全局static变量触发自动注册
+    Note over MF: DEFINE_AND_REGISTER_METHOD(InferMethod)<br/>→ static MethodRegistry r("InferMethod", creator)<br/>→ MethodFactory::GetInstance()->MethodRegister(...)
+    Note over MF: DEFINE_AND_REGISTER_METHOD(QATCenterPointPostProcessMethod)<br/>→ static MethodRegistry r(...) 同上
+
+    main->>WP: WorkflowPlugin::GetInstance()->Init("", json)
+    WP->>MF: GetMethod("InferMethod")
+    MF-->>WP: new InferMethod
+    WP->>IM: InitFromJsonString(method_config)
+    IM->>IM: hbDNNInitializeFromFiles() 加载.hbm模型
+    WP->>MF: GetMethod("QATCenterPointPostProcessMethod")
+    MF-->>WP: new QATCenterPointPostProcessMethod
+    WP->>PM: InitFromJsonString(method_config)
+    WP->>WP: instances[i] = {infer_method, pp_method}
+
+    main->>IP: InputProducerPlugin::GetInstance()->Init("", json)
+    IP->>RDI: DataIterator::GetImpl("raw_data") → new RawDataIterator
+    RDI->>MF: GetMethod("QATCenterPointPreProcessMethod")
+    MF-->>RDI: new QATCenterPointPreProcessMethod
+    RDI->>RDI: preprocess_method_->InitFromJsonString(...)
+
+    main->>IP: input_plg->Start()
+    main->>WP: workflow_plg->Start()
+
+    loop 推理循环 WorkflowPlugin::Run(instance_id)
+        IP->>WP: FeedWorkflow(image_tensor)
+        WP->>IM: DoProcess(image_tensor)<br/>→ hbUCPSubmitTask / hbUCPWaitTaskDone
+        IM-->>WP: output_tensors
+        WP->>PM: DoProcess(image_tensor, output_tensors)
+        PM-->>WP: perception
+        WP->>WP: OutputConsumerPlugin输出结果
+    end

@@ -1,0 +1,71 @@
+graph TD
+    subgraph ai_core_code["ai_core/code/"]
+
+        subgraph include["include/ (头文件层)"]
+            inc_base["base/\n基础数据结构/类型定义"]
+            inc_input["input/\n输入模块接口"]
+            inc_method["method/\n算法方法接口"]
+            inc_output["output/\n输出模块接口"]
+            inc_plugin["plugin/\n插件系统接口"]
+            inc_utils["utils/\n工具类接口"]
+        end
+
+        subgraph src["src/ (实现层)"]
+            src_input["input/\n输入实现\n(图像/点云/传感器数据)"]
+            src_method["method/\n算法实现\n(BEV/CenterPoint/DenseTNT/QCNet)"]
+            src_output["output/\n输出实现\n(检测框/轨迹/分割结果)"]
+            src_plugin["plugin/\n插件实现\n(DSP/BPU调度)"]
+            src_utils["utils/\n工具实现\n(前后处理/序列化)"]
+        end
+
+        entry["simple_example.cc\n使用示例/入口"]
+
+        subgraph build["构建系统"]
+            cmake["CMakeLists.txt"]
+            build_sh["build_all.sh"]
+            resolve_sh["resolve.sh"]
+        end
+    end
+
+    subgraph deps["deps_aarch64/ (第三方库)"]
+        gflags["gflags/\n命令行参数解析"]
+        glog["glog/\n日志库"]
+    end
+
+    subgraph ext["外部系统依赖"]
+        dnn["libdnn.so\nD-Robotics BPU推理引擎"]
+        hbucp["hbucp\nBPU通信库"]
+    end
+
+    %% 头文件依赖
+    src_input -->|implements| inc_input
+    src_method -->|implements| inc_method
+    src_output -->|implements| inc_output
+    src_plugin -->|implements| inc_plugin
+    src_utils -->|implements| inc_utils
+
+    %% 模块间依赖
+    src_method -->|uses| src_input
+    src_method -->|uses| src_utils
+    src_output -->|uses| src_utils
+    src_plugin -->|schedules| src_method
+    inc_method -->|depends on| inc_base
+    inc_input -->|depends on| inc_base
+    inc_output -->|depends on| inc_base
+
+    %% 入口依赖
+    entry -->|uses| inc_input
+    entry -->|uses| inc_method
+    entry -->|uses| inc_output
+    entry -->|uses| inc_plugin
+
+    %% 外部依赖
+    src_method -->|calls| dnn
+    src_plugin -->|calls| hbucp
+    cmake -->|links| gflags
+    cmake -->|links| glog
+    cmake -->|links| dnn
+
+    %% 构建
+    build_sh -->|invokes| cmake
+    resolve_sh -->|resolves deps for| cmake

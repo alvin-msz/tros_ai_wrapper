@@ -1,0 +1,180 @@
+classDiagram
+    class BasePlugin {
+        +Init(config_file, config_string)
+        +Start()
+        +Stop()
+        +LoadConfig(config_string)
+    }
+
+    class InputProducerPlugin {
+        -DataIterator data_iterator
+        -Thread produce_thread
+        -int limit
+        +GetInstance() InputProducerPlugin
+        +Init()
+        +Start()
+        +Stop()
+        +Run()
+        +IsRunning() bool
+        +Release(ImageTensorPtr)
+        +LoadConfig()
+    }
+
+    class WorkflowPlugin {
+        -InferMethod[] infer_instances
+        -PostProcessMethod[] pp_instances
+        -PCQueue pc_queue
+        -hbDNNHandle_t dnn_handle
+        -hbDNNTensor[] reletated_tensor
+        -hbDNNTensor[][] temporal_tensor
+        +GetInstance() WorkflowPlugin
+        +Init()
+        +Start()
+        +Stop()
+        +FeedWorkflow(ImageTensorPtr)
+        +Run(instance_id)
+        +GetModelHandle()
+        +GetMajorModelTensor()
+        +GetTemporalModelTensor()
+        +UpdateTemporalTensor()
+    }
+
+    class OutputConsumerPlugin {
+        -OutputModule output_module
+        -PCQueue pc_queue
+        -callback
+        +GetInstance() OutputConsumerPlugin
+        +Init()
+        +Start()
+        +Stop()
+        +Send(OutputMessage)
+        +Run()
+        +SetCallback()
+        +SetRenderImgsFunc()
+    }
+
+    class Method {
+        <<abstract>>
+        +Init(config_file_path)
+        +InitFromJsonString(config)*
+    }
+
+    class InferMethod {
+        -hbDNNHandle_t dnn_handle
+        -TensorVectorPool tensor_vector_pool
+        -bool is_temporal_model
+        -bool is_releated_model
+        +InitFromJsonString(config)
+        +DoProcess(ImageTensor) TensorVectorPtr
+        +GetModelHandle()
+        +Release()
+    }
+
+    class PreProcessMethod {
+        <<abstract>>
+        +DoProcess(ImageTensor)*
+        +SetModelHandle(hbDNNHandle_t)
+    }
+
+    class PostProcessMethod {
+        <<abstract>>
+        +DoProcess(ImageTensor, TensorVectorPtr)*
+    }
+
+    class QATCenterPointPreProcessMethod {
+        +InitFromJsonString()
+        +DoProcess(ImageTensor)
+        +CallDspRpc()
+        +ProcessInDsp()
+    }
+
+    class QATCenterPointPostProcessMethod {
+        +InitFromJsonString()
+        +DoProcess(ImageTensor, TensorVectorPtr)
+    }
+
+    class QATBevformerPostProcessMethod {
+        +InitFromJsonString()
+        +DoProcess()
+    }
+
+    class QATBevDetectionPostProcessMethod {
+        +InitFromJsonString()
+        +DoProcess()
+    }
+
+    class QATFlashoccPostProcessMethod {
+        +InitFromJsonString()
+        +DoProcess()
+    }
+
+    class QATLidarMultiTaskPostProcessMethod {
+        +InitFromJsonString()
+        +DoProcess()
+    }
+
+    class QATBevFusionMultiSensorPreProcessMethod {
+        -PreProcessMethod pillar_preprocess
+        +InitFromJsonString()
+        +DoProcess()
+    }
+
+    class MethodFactory {
+        -unordered_map method_registry
+        +GetInstance() MethodFactory
+        +GetMethod(name) Method
+        +MethodRegister(name, creator)
+    }
+
+    class MethodRegistry {
+        +MethodRegistry(name, creator)
+    }
+
+    class DataIterator {
+        <<abstract>>
+        +GetImpl(type) DataIterator
+        +Init(config)
+        +Next(ImageTensor)
+        +HasNext() bool
+        +Release(ImageTensor)
+    }
+
+    class RawDataIterator {
+        -PreProcessMethod preprocess_method
+        +Init()
+        +InitPreProcess()
+        +Next()
+    }
+
+    BasePlugin <|-- InputProducerPlugin
+    BasePlugin <|-- WorkflowPlugin
+    BasePlugin <|-- OutputConsumerPlugin
+
+    Method <|-- InferMethod
+    Method <|-- PreProcessMethod
+    Method <|-- PostProcessMethod
+
+    PreProcessMethod <|-- QATCenterPointPreProcessMethod
+    PreProcessMethod <|-- QATBevFusionMultiSensorPreProcessMethod
+
+    PostProcessMethod <|-- QATCenterPointPostProcessMethod
+    PostProcessMethod <|-- QATBevformerPostProcessMethod
+    PostProcessMethod <|-- QATBevDetectionPostProcessMethod
+    PostProcessMethod <|-- QATFlashoccPostProcessMethod
+    PostProcessMethod <|-- QATLidarMultiTaskPostProcessMethod
+
+    MethodRegistry --> MethodFactory : registers into
+    MethodFactory ..> Method : creates
+
+    InputProducerPlugin --> DataIterator : owns
+    DataIterator <|-- RawDataIterator
+    RawDataIterator --> PreProcessMethod : owns & calls
+
+    WorkflowPlugin --> InferMethod : owns instances
+    WorkflowPlugin --> PostProcessMethod : owns instances
+    WorkflowPlugin --> MethodFactory : GetMethod()
+    WorkflowPlugin --> OutputConsumerPlugin : Send(result)
+
+    InputProducerPlugin --> WorkflowPlugin : FeedWorkflow()
+
+    QATBevFusionMultiSensorPreProcessMethod --> QATCenterPointPreProcessMethod : delegates pillar preprocess

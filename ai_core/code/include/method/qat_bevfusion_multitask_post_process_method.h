@@ -22,7 +22,8 @@
  * lidarSeg) for raw_output multitask logging.
  *
  * Tensor layout defaults follow QATBevformerPostProcessMethod (det: base..base+3)
- * plus one OCC tensor at occ_tensor_idx (NHWC int8/int32, argmax on classes).
+ * plus one OCC tensor at occ_tensor_idx (NDHW INT32 after BPU argmax, or
+ * NDHWC int8 logits for legacy graphs).
  */
 class QATBevFusionMultitaskPostProcessMethod : public PostProcessMethod {
  public:
@@ -53,6 +54,8 @@ class QATBevFusionMultitaskPostProcessMethod : public PostProcessMethod {
   float occ_scale_height_{0.f};
   float occ_scale_width_{0.f};
   bool occ_use_int32_{false};
+  /** When true, skip BEV 2D upsample path (use with BPU argmax 4D output). */
+  bool occ_skip_bev_2d_{true};
 };
 
 #endif  // DNN_AI_BENCHMARK_CODE_INCLUDE_METHOD_QAT_BEVFUSION_MULTITASK_POST_PROCESS_METHOD_H_

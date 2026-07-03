@@ -136,6 +136,132 @@ std::vector<std::vector<float>> DenormalizeBbox(
   return denormalized_bboxes;
 }
 
+/** True when OCC tensor is BPU argmax class map [N,H,W,Dz] (not NDHWC logits). */
+bool OccIsBpuArgmaxOutput(const hbDNNTensor &tensor) {
+  const int32_t occ_type = tensor.properties.tensorType;
+  const bool type_ok = occ_type == HB_DNN_TENSOR_TYPE_S8 ||
+                       occ_type == HB_DNN_TENSOR_TYPE_U8 ||
+                       occ_type == HB_DNN_TENSOR_TYPE_S32 ||
+                       occ_type == HB_DNN_TENSOR_TYPE_S64;
+  if (!type_ok) {
+    return false;
+  }
+
+  const uint32_t rank = tensor.properties.validShape.numDimensions;
+  const auto &vs = tensor.properties.validShape;
+  if (rank == 4U) {
+    // [N,H,W,Dz] e.g. [1,200,200,16]; must not hit legacy NHWC OccArgmaxNhwc.
+    return true;
+  }
+  if (rank == 5U && vs.dimensionSize[4] == 1) {
+    // Some graphs keep a trailing singleton dim after argmax.
+    return true;
+  }
+  return false;
+}
+
+/** BPU argmax output: layout [N,H,W,Dz] class index per voxel (INT8/UINT8/S32/S64). */
+void OccCopySeg3dNdhw(hbDNNTensor *tensor, Parsing3d<uint32_t> *seg3d) {
+  auto &vs = tensor->properties.validShape;
+  int32_t seg_h = vs.dimensionSize[1];
+  int32_t seg_w = vs.dimensionSize[2];
+  int32_t seg_z = vs.dimensionSize[3];
+
+  int32_t seg_w_aligned =
+      tensor->properties.stride[1] / tensor->properties.stride[2];
+  int32_t seg_z_aligned =
+      tensor->properties.stride[2] / tensor->properties.stride[3];
+
+  const char *raw_base =
+      reinterpret_cast<const char *>(tensor->sysMem.virAddr);
+
+  auto read_class_id = [&](int32_t elem_idx, int64_t byte_off) -> int32_t {
+    switch (tensor->properties.tensorType) {
+      case HB_DNN_TENSOR_TYPE_S8:
+        return static_cast<int32_t>(reinterpret_cast<const int8_t *>(
+            raw_base)[elem_idx]);
+      case HB_DNN_TENSOR_TYPE_U8:
+        return static_cast<int32_t>(reinterpret_cast<const uint8_t *>(
+            raw_base)[elem_idx]);
+      case HB_DNN_TENSOR_TYPE_S32:
+        return *reinterpret_cast<const int32_t *>(raw_base + byte_off);
+      case HB_DNN_TENSOR_TYPE_S64:
+        return static_cast<int32_t>(
+            *reinterpret_cast<const int64_t *>(raw_base + byte_off));
+      default:
+        VLOG(EXAMPLE_SYSTEM) << "OccCopySeg3dNdhw: unsupported type "
+                             << tensor->properties.tensorType;
+        return 0;
+    }
+  };
+
+  int32_t seg_k_hwz = seg_h * seg_w * seg_z;
+  seg3d->num_classes = 18;
+  seg3d->h = seg_h;
+  seg3d->w = seg_w;
+  seg3d->z = seg_z;
+  seg3d->seg.resize(static_cast<size_t>(seg_k_hwz));
+
+  for (int32_t h = 0; h < seg_h; ++h) {
+    int32_t h_idx = h * seg_w_aligned * seg_z_aligned;
+    int32_t h_k = h * seg_w * seg_z;
+    for (int32_t w = 0; w < seg_w; ++w) {
+      int32_t hw_idx = h_idx + w * seg_z_aligned;
+      int32_t hw_k = h_k + w * seg_z;
+      for (int32_t z = 0; z < seg_z; ++z) {
+        const int32_t elem_idx = hw_idx + z;
+        const int64_t byte_off = static_cast<int64_t>(h) *
+                                     tensor->properties.stride[1] +
+                                 static_cast<int64_t>(w) *
+                                     tensor->properties.stride[2] +
+                                 static_cast<int64_t>(z) *
+                                     tensor->properties.stride[3];
+        int32_t v = read_class_id(elem_idx, byte_off);
+        seg3d->seg[static_cast<size_t>(hw_k + z)] =
+            static_cast<uint32_t>(std::max(0, v));
+      }
+    }
+  }
+}
+
+/** BEV collapse from seg3d; same rule as draw_2d_occ (last non-free wins). */
+void OccBuildLidarSegFromSeg3d(const Parsing3d<uint32_t> &seg3d,
+                               Parsing<uint8_t> *lidar_seg) {
+  const int32_t seg_h = seg3d.h;
+  const int32_t seg_w = seg3d.w;
+  const int32_t seg_z = seg3d.z;
+  if (seg_h <= 0 || seg_w <= 0 || seg_z <= 0 ||
+      static_cast<int32_t>(seg3d.seg.size()) < seg_h * seg_w * seg_z) {
+    lidar_seg->seg.clear();
+    lidar_seg->height = lidar_seg->width = 0;
+    return;
+  }
+
+  const uint32_t free_id =
+      seg3d.num_classes > 0 ? seg3d.num_classes - 1U : 17U;
+  const int32_t k_hw = seg_h * seg_w;
+  lidar_seg->num_classes =
+      seg3d.num_classes > 0 ? static_cast<int>(seg3d.num_classes) : 18;
+  lidar_seg->height = seg_h;
+  lidar_seg->width = seg_w;
+  lidar_seg->seg.resize(static_cast<size_t>(k_hw));
+
+  for (int32_t h = 0; h < seg_h; ++h) {
+    for (int32_t w = 0; w < seg_w; ++w) {
+      const int32_t base_idx = (h * seg_w + w) * seg_z;
+      uint32_t best_cls = free_id;
+      for (int32_t z = 0; z < seg_z; ++z) {
+        const uint32_t cls = seg3d.seg[static_cast<size_t>(base_idx + z)];
+        if (cls != free_id) {
+          best_cls = cls;
+        }
+      }
+      lidar_seg->seg[static_cast<size_t>(h * seg_w + w)] =
+          static_cast<uint8_t>(best_cls);
+    }
+  }
+}
+
 /**
  * BEVOCCHead2D / multitask: layout [N,H,W,Dz,C] (e.g. [1,200,200,16,18]).
  * INT8 or UINT8 logits; per-voxel argmax in C, then BEV collapse (max over Z).
@@ -371,6 +497,9 @@ int QATBevFusionMultitaskPostProcessMethod::InitFromJsonString(
   }
   if (document.HasMember("occ_use_int32")) {
     occ_use_int32_ = document["occ_use_int32"].GetBool();
+  }
+  if (document.HasMember("occ_skip_bev_2d")) {
+    occ_skip_bev_2d_ = document["occ_skip_bev_2d"].GetBool();
   }
 
   if (document.HasMember("bev_range")) {
@@ -610,7 +739,18 @@ int QATBevFusionMultitaskPostProcessMethod::PostProcess(
 
   hbDNNTensor &occ_tensor = tensors[occ_idx];
   uint32_t occ_rank = occ_tensor.properties.validShape.numDimensions;
-  if (occ_rank >= 5U &&
+  const int32_t occ_type = occ_tensor.properties.tensorType;
+  const auto &occ_vs = occ_tensor.properties.validShape;
+  const bool occ_is_bpu_argmax = OccIsBpuArgmaxOutput(occ_tensor);
+  if (occ_is_bpu_argmax) {
+    VLOG(EXAMPLE_DEBUG) << "OCC output NDHW BPU argmax (rank=" << occ_rank
+                        << ", shape=" << occ_vs.dimensionSize[1] << "x"
+                        << occ_vs.dimensionSize[2] << "x"
+                        << occ_vs.dimensionSize[3] << ", type=" << occ_type
+                        << ").";
+    OccCopySeg3dNdhw(&occ_tensor, &perception->seg3d);
+    OccBuildLidarSegFromSeg3d(perception->seg3d, &perception->lidarSeg);
+  } else if (occ_rank >= 5U &&
       (occ_tensor.properties.tensorType == HB_DNN_TENSOR_TYPE_S8 ||
        occ_tensor.properties.tensorType == HB_DNN_TENSOR_TYPE_U8)) {
     VLOG(EXAMPLE_DEBUG) << "OCC output NDHWC packed (rank=" << occ_rank
@@ -618,12 +758,29 @@ int QATBevFusionMultitaskPostProcessMethod::PostProcess(
     OccArgmaxNdhwcPacked(&occ_tensor, &perception->seg3d, &perception->lidarSeg,
                          occ_resize_height_, occ_resize_width_, occ_scale_height_,
                          occ_scale_width_);
-  } else {
+  } else if (!occ_skip_bev_2d_ && occ_rank == 4U) {
+    // Legacy 2D BEV NHWC logits only; never treat NDHW BPU argmax as NHWC.
+    VLOG(EXAMPLE_SYSTEM)
+        << "OCC rank-4 tensor is not BPU argmax (type=" << occ_type
+        << "); refusing OccArgmaxNhwc to avoid mis-reading [N,H,W,Dz] as NHWC.";
+    perception->seg3d.seg.clear();
+    perception->seg3d.h = perception->seg3d.w = perception->seg3d.z = 0;
+    perception->lidarSeg.seg.clear();
+    perception->lidarSeg.height = perception->lidarSeg.width = 0;
+  } else if (!occ_skip_bev_2d_) {
     perception->seg3d.seg.clear();
     perception->seg3d.h = perception->seg3d.w = perception->seg3d.z = 0;
     OccArgmaxNhwc(&occ_tensor, &perception->lidarSeg, occ_resize_height_,
                   occ_resize_width_, occ_scale_height_, occ_scale_width_,
                   occ_use_int32_);
+  } else {
+    VLOG(EXAMPLE_SYSTEM) << "Unexpected OCC tensor rank=" << occ_rank
+                         << " type=" << occ_tensor.properties.tensorType
+                         << "; expected 4D BPU argmax or 5D NDHWC logits.";
+    perception->seg3d.seg.clear();
+    perception->seg3d.h = perception->seg3d.w = perception->seg3d.z = 0;
+    perception->lidarSeg.seg.clear();
+    perception->lidarSeg.height = perception->lidarSeg.width = 0;
   }
 
   const uint64_t post_us = Stopwatch::CurrentTs() - post_t0;

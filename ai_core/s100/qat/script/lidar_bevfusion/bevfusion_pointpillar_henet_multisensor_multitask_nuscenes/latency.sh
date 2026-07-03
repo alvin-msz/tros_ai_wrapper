@@ -9,7 +9,6 @@
 
 source ../../env.sh
 export PATH=../../../script/aarch64/bin:$PATH
-
 ${app} \
   --config_file=workflow_latency.json \
   --log_level=1

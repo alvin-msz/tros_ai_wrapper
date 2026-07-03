@@ -39,6 +39,7 @@
         "occ_scale_height": 0,
         "occ_scale_width": 0,
         "occ_use_int32": false,
+        "occ_skip_bev_2d": true,
         "bev_range": [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0],
         "post_center_range": [-61.2, -61.2, -10.0, 61.2, 61.2, 10.0],
         "ori_shape": [900, 1600],

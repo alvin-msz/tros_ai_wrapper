@@ -1,0 +1,11 @@
+{
+  "pillar_config_file": "../../config/preprocess/centerpoint_preprocess_5dim_ego.json",
+  "lidar_bin_name": "lidar_points.bin",
+  "auxiliary_bin_names": [
+    "img.bin",
+    "queries_rebatch_grid.bin",
+    "restore_bev_grid.bin",
+    "reference_points_rebatch.bin",
+    "bev_pillar_counts.bin"
+  ]
+}

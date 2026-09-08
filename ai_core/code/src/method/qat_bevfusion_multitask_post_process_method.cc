@@ -11,10 +11,15 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <limits>
 #include <numeric>
+#include <sstream>
+#include <string>
+#include <sys/stat.h>
 
 #include "base/common_def.h"
 #include "hobot/dnn/hb_dnn.h"
@@ -28,6 +33,11 @@
 DEFINE_AND_REGISTER_METHOD(QATBevFusionMultitaskPostProcessMethod);
 
 namespace {
+
+static void EnsureDir(const std::string &dir) {
+  if (dir.empty()) return;
+  mkdir(dir.c_str(), 0755);
+}
 
 float Sigmoid(float x) { return 1.0f / (1.0f + std::exp(-x)); }
 
@@ -134,132 +144,6 @@ std::vector<std::vector<float>> DenormalizeBbox(
   }
 
   return denormalized_bboxes;
-}
-
-/** True when OCC tensor is BPU argmax class map [N,H,W,Dz] (not NDHWC logits). */
-bool OccIsBpuArgmaxOutput(const hbDNNTensor &tensor) {
-  const int32_t occ_type = tensor.properties.tensorType;
-  const bool type_ok = occ_type == HB_DNN_TENSOR_TYPE_S8 ||
-                       occ_type == HB_DNN_TENSOR_TYPE_U8 ||
-                       occ_type == HB_DNN_TENSOR_TYPE_S32 ||
-                       occ_type == HB_DNN_TENSOR_TYPE_S64;
-  if (!type_ok) {
-    return false;
-  }
-
-  const uint32_t rank = tensor.properties.validShape.numDimensions;
-  const auto &vs = tensor.properties.validShape;
-  if (rank == 4U) {
-    // [N,H,W,Dz] e.g. [1,200,200,16]; must not hit legacy NHWC OccArgmaxNhwc.
-    return true;
-  }
-  if (rank == 5U && vs.dimensionSize[4] == 1) {
-    // Some graphs keep a trailing singleton dim after argmax.
-    return true;
-  }
-  return false;
-}
-
-/** BPU argmax output: layout [N,H,W,Dz] class index per voxel (INT8/UINT8/S32/S64). */
-void OccCopySeg3dNdhw(hbDNNTensor *tensor, Parsing3d<uint32_t> *seg3d) {
-  auto &vs = tensor->properties.validShape;
-  int32_t seg_h = vs.dimensionSize[1];
-  int32_t seg_w = vs.dimensionSize[2];
-  int32_t seg_z = vs.dimensionSize[3];
-
-  int32_t seg_w_aligned =
-      tensor->properties.stride[1] / tensor->properties.stride[2];
-  int32_t seg_z_aligned =
-      tensor->properties.stride[2] / tensor->properties.stride[3];
-
-  const char *raw_base =
-      reinterpret_cast<const char *>(tensor->sysMem.virAddr);
-
-  auto read_class_id = [&](int32_t elem_idx, int64_t byte_off) -> int32_t {
-    switch (tensor->properties.tensorType) {
-      case HB_DNN_TENSOR_TYPE_S8:
-        return static_cast<int32_t>(reinterpret_cast<const int8_t *>(
-            raw_base)[elem_idx]);
-      case HB_DNN_TENSOR_TYPE_U8:
-        return static_cast<int32_t>(reinterpret_cast<const uint8_t *>(
-            raw_base)[elem_idx]);
-      case HB_DNN_TENSOR_TYPE_S32:
-        return *reinterpret_cast<const int32_t *>(raw_base + byte_off);
-      case HB_DNN_TENSOR_TYPE_S64:
-        return static_cast<int32_t>(
-            *reinterpret_cast<const int64_t *>(raw_base + byte_off));
-      default:
-        VLOG(EXAMPLE_SYSTEM) << "OccCopySeg3dNdhw: unsupported type "
-                             << tensor->properties.tensorType;
-        return 0;
-    }
-  };
-
-  int32_t seg_k_hwz = seg_h * seg_w * seg_z;
-  seg3d->num_classes = 18;
-  seg3d->h = seg_h;
-  seg3d->w = seg_w;
-  seg3d->z = seg_z;
-  seg3d->seg.resize(static_cast<size_t>(seg_k_hwz));
-
-  for (int32_t h = 0; h < seg_h; ++h) {
-    int32_t h_idx = h * seg_w_aligned * seg_z_aligned;
-    int32_t h_k = h * seg_w * seg_z;
-    for (int32_t w = 0; w < seg_w; ++w) {
-      int32_t hw_idx = h_idx + w * seg_z_aligned;
-      int32_t hw_k = h_k + w * seg_z;
-      for (int32_t z = 0; z < seg_z; ++z) {
-        const int32_t elem_idx = hw_idx + z;
-        const int64_t byte_off = static_cast<int64_t>(h) *
-                                     tensor->properties.stride[1] +
-                                 static_cast<int64_t>(w) *
-                                     tensor->properties.stride[2] +
-                                 static_cast<int64_t>(z) *
-                                     tensor->properties.stride[3];
-        int32_t v = read_class_id(elem_idx, byte_off);
-        seg3d->seg[static_cast<size_t>(hw_k + z)] =
-            static_cast<uint32_t>(std::max(0, v));
-      }
-    }
-  }
-}
-
-/** BEV collapse from seg3d; same rule as draw_2d_occ (last non-free wins). */
-void OccBuildLidarSegFromSeg3d(const Parsing3d<uint32_t> &seg3d,
-                               Parsing<uint8_t> *lidar_seg) {
-  const int32_t seg_h = seg3d.h;
-  const int32_t seg_w = seg3d.w;
-  const int32_t seg_z = seg3d.z;
-  if (seg_h <= 0 || seg_w <= 0 || seg_z <= 0 ||
-      static_cast<int32_t>(seg3d.seg.size()) < seg_h * seg_w * seg_z) {
-    lidar_seg->seg.clear();
-    lidar_seg->height = lidar_seg->width = 0;
-    return;
-  }
-
-  const uint32_t free_id =
-      seg3d.num_classes > 0 ? seg3d.num_classes - 1U : 17U;
-  const int32_t k_hw = seg_h * seg_w;
-  lidar_seg->num_classes =
-      seg3d.num_classes > 0 ? static_cast<int>(seg3d.num_classes) : 18;
-  lidar_seg->height = seg_h;
-  lidar_seg->width = seg_w;
-  lidar_seg->seg.resize(static_cast<size_t>(k_hw));
-
-  for (int32_t h = 0; h < seg_h; ++h) {
-    for (int32_t w = 0; w < seg_w; ++w) {
-      const int32_t base_idx = (h * seg_w + w) * seg_z;
-      uint32_t best_cls = free_id;
-      for (int32_t z = 0; z < seg_z; ++z) {
-        const uint32_t cls = seg3d.seg[static_cast<size_t>(base_idx + z)];
-        if (cls != free_id) {
-          best_cls = cls;
-        }
-      }
-      lidar_seg->seg[static_cast<size_t>(h * seg_w + w)] =
-          static_cast<uint8_t>(best_cls);
-    }
-  }
 }
 
 /**
@@ -377,6 +261,265 @@ void OccArgmaxNdhwcPacked(hbDNNTensor *tensor, Parsing3d<uint32_t> *seg3d,
     }
     lidar_seg->seg[static_cast<size_t>(k)] =
         static_cast<uint8_t>(std::max(0, top_index));
+  }
+}
+
+int32_t OccElemBytes(int32_t tensor_type) {
+  switch (tensor_type) {
+    case HB_DNN_TENSOR_TYPE_S32:
+    case HB_DNN_TENSOR_TYPE_U32:
+    case HB_DNN_TENSOR_TYPE_F32:
+      return 4;
+    case HB_DNN_TENSOR_TYPE_S16:
+    case HB_DNN_TENSOR_TYPE_U16:
+    case HB_DNN_TENSOR_TYPE_F16:
+      return 2;
+    default:
+      return 1;
+  }
+}
+
+int32_t OccReadClassId(const hbDNNTensor *tensor, int64_t byte_off) {
+  const char *p =
+      reinterpret_cast<const char *>(tensor->sysMem.virAddr) + byte_off;
+  switch (tensor->properties.tensorType) {
+    case HB_DNN_TENSOR_TYPE_S32:
+      return *reinterpret_cast<const int32_t *>(p);
+    case HB_DNN_TENSOR_TYPE_S16:
+      return static_cast<int32_t>(*reinterpret_cast<const int16_t *>(p));
+    case HB_DNN_TENSOR_TYPE_U8:
+      return static_cast<int32_t>(*reinterpret_cast<const uint8_t *>(p));
+    case HB_DNN_TENSOR_TYPE_S8:
+    default:
+      return static_cast<int32_t>(*reinterpret_cast<const int8_t *>(p));
+  }
+}
+
+std::string OccTensorDesc(const hbDNNTensor &t) {
+  std::ostringstream oss;
+  const auto &vs = t.properties.validShape;
+  oss << "rank=" << vs.numDimensions << " shape=[";
+  for (int32_t i = 0; i < vs.numDimensions; ++i) {
+    if (i > 0) {
+      oss << ",";
+    }
+    oss << vs.dimensionSize[i];
+  }
+  oss << "] type=" << t.properties.tensorType
+      << " aligned=" << t.properties.alignedByteSize << " stride=[";
+  for (int32_t i = 0; i < vs.numDimensions; ++i) {
+    if (i > 0) {
+      oss << ",";
+    }
+    oss << t.properties.stride[i];
+  }
+  oss << "]";
+  return oss.str();
+}
+
+int64_t OccShapeVolume(const hbDNNTensor &t) {
+  const auto &vs = t.properties.validShape;
+  int64_t vol = 1;
+  for (int32_t i = 0; i < vs.numDimensions; ++i) {
+    const int32_t di = vs.dimensionSize[i];
+    if (di > 0) {
+      vol *= static_cast<int64_t>(di);
+    }
+  }
+  return vol;
+}
+
+bool OccLooksLikeLogits(const hbDNNTensor &t, int32_t num_classes) {
+  const auto &vs = t.properties.validShape;
+  if (vs.numDimensions < 5) {
+    return false;
+  }
+  const int32_t last = vs.dimensionSize[vs.numDimensions - 1];
+  const int32_t d1 = vs.dimensionSize[1];
+  return last == num_classes && d1 > 1 && vs.dimensionSize[2] > 1;
+}
+
+bool OccLooksLikeGrid(const hbDNNTensor &t) {
+  const int64_t vol = OccShapeVolume(t);
+  // Occ3D 200x200x16 class ids, or 200x200x16x18 logits.
+  return vol == 640000 || vol == 11520000;
+}
+
+int ResolveOccTensorIdx(const std::vector<hbDNNTensor> &tensors,
+                        int preferred) {
+  auto usable = [](const hbDNNTensor &t) {
+    return OccLooksLikeGrid(t) && t.properties.alignedByteSize > 0 &&
+           t.sysMem.virAddr != nullptr;
+  };
+  if (preferred >= 0 && preferred < static_cast<int>(tensors.size()) &&
+      usable(tensors[preferred])) {
+    return preferred;
+  }
+  int best = -1;
+  int64_t best_vol = 0;
+  for (int i = 0; i < static_cast<int>(tensors.size()); ++i) {
+    if (!usable(tensors[i])) {
+      continue;
+    }
+    const int64_t vol = OccShapeVolume(tensors[i]);
+    if (vol > best_vol) {
+      best_vol = vol;
+      best = i;
+    }
+  }
+  if (best >= 0) {
+    return best;
+  }
+  if (preferred >= 0 && preferred < static_cast<int>(tensors.size())) {
+    return preferred;
+  }
+  return tensors.empty() ? -1 : static_cast<int>(tensors.size()) - 1;
+}
+
+struct OccHwzLayout {
+  int32_t h = 0;
+  int32_t w = 0;
+  int32_t z = 0;
+  int64_t sh = 0;
+  int64_t sw = 0;
+  int64_t sz = 0;
+  bool ok = false;
+};
+
+OccHwzLayout InferOccClassIdLayout(const hbDNNTensor &t) {
+  const auto &vs = t.properties.validShape;
+  const int32_t *d = vs.dimensionSize;
+  const int64_t *st = t.properties.stride;
+  const uint32_t rank = vs.numDimensions;
+  OccHwzLayout L;
+
+  auto set_from = [&](int hi, int wi, int zi) {
+    L.h = d[hi];
+    L.w = d[wi];
+    L.z = d[zi];
+    L.sh = st[hi];
+    L.sw = st[wi];
+    L.sz = st[zi];
+    L.ok = (L.h > 0 && L.w > 0 && L.z > 0);
+  };
+
+  if (rank == 5) {
+    if (d[1] <= 1 && d[2] > 1 && d[3] > 1) {
+      set_from(2, 3, 4);  // [N,1,H,W,Z]
+    } else if (d[4] <= 1) {
+      set_from(1, 2, 3);  // [N,H,W,Z,1]
+    } else {
+      set_from(1, 2, 3);
+    }
+  } else if (rank == 4) {
+    // NCHW [N,Z,H,W] when Z is the small axis.
+    if (d[1] <= 32 && d[2] >= 64 && d[3] >= 64 && d[1] < d[2] &&
+        d[1] < d[3]) {
+      set_from(2, 3, 1);
+    } else {
+      set_from(1, 2, 3);  // [N,H,W,Z]
+    }
+  } else if (rank == 3) {
+    if (d[0] <= 32 && d[1] >= 64 && d[2] >= 64) {
+      set_from(1, 2, 0);  // [Z,H,W]
+    } else {
+      set_from(0, 1, 2);  // [H,W,Z]
+    }
+  } else if (rank == 2 && OccShapeVolume(t) == 640000) {
+    L.h = 200;
+    L.w = 200;
+    L.z = 16;
+    const int32_t es = OccElemBytes(t.properties.tensorType);
+    L.sz = es;
+    L.sw = static_cast<int64_t>(L.z) * es;
+    L.sh = static_cast<int64_t>(L.w) * L.z * es;
+    L.ok = true;
+  }
+
+  if (L.ok && (L.sh == 0 || L.sw == 0 || L.sz == 0)) {
+    const int32_t es = OccElemBytes(t.properties.tensorType);
+    L.sz = es;
+    L.sw = static_cast<int64_t>(L.z) * es;
+    L.sh = static_cast<int64_t>(L.w) * L.z * es;
+  }
+  return L;
+}
+
+/**
+ * BPU argmax already applied: class ids, not logits — do not dequant.
+ * Accepts [N,H,W,Z], [N,H,W,Z,1], [N,1,H,W,Z], NCHW [N,Z,H,W], rank-3 HWZ.
+ */
+void OccCopyNdhwClassIds(hbDNNTensor *tensor, Parsing3d<uint32_t> *seg3d,
+                         Parsing<uint8_t> *lidar_seg, int32_t resize_h,
+                         int32_t resize_w, int32_t num_classes) {
+  const OccHwzLayout layout = InferOccClassIdLayout(*tensor);
+  if (!layout.ok || tensor->sysMem.virAddr == nullptr ||
+      tensor->properties.alignedByteSize <= 0) {
+    VLOG(EXAMPLE_SYSTEM) << "OCC class-id copy skipped: "
+                         << OccTensorDesc(*tensor)
+                         << " layout_ok=" << layout.ok;
+    return;
+  }
+
+  const int32_t seg_h = layout.h;
+  const int32_t seg_w = layout.w;
+  const int32_t seg_z = layout.z;
+  const int32_t seg_k_hwz = seg_h * seg_w * seg_z;
+  seg3d->num_classes = static_cast<uint32_t>(std::max(num_classes, 1));
+  seg3d->h = seg_h;
+  seg3d->w = seg_w;
+  seg3d->z = seg_z;
+  seg3d->seg.resize(static_cast<size_t>(seg_k_hwz));
+
+  auto class_at = [&](int32_t h, int32_t w, int32_t z) -> int32_t {
+    const int64_t off = static_cast<int64_t>(h) * layout.sh +
+                        static_cast<int64_t>(w) * layout.sw +
+                        static_cast<int64_t>(z) * layout.sz;
+    return OccReadClassId(tensor, off);
+  };
+
+  for (int32_t h = 0; h < seg_h; ++h) {
+    const int32_t h_k = h * seg_w * seg_z;
+    for (int32_t w = 0; w < seg_w; ++w) {
+      const int32_t hw_k = h_k + w * seg_z;
+      for (int32_t z = 0; z < seg_z; ++z) {
+        const int32_t label = std::max(0, class_at(h, w, z));
+        seg3d->seg[static_cast<size_t>(hw_k + z)] =
+            static_cast<uint32_t>(label);
+      }
+    }
+  }
+
+  const int32_t free_index = std::max(0, num_classes - 1);
+  std::vector<uint8_t> bev(static_cast<size_t>(seg_h * seg_w),
+                           static_cast<uint8_t>(free_index));
+  for (int32_t h = 0; h < seg_h; ++h) {
+    for (int32_t w = 0; w < seg_w; ++w) {
+      uint8_t lab = static_cast<uint8_t>(free_index);
+      for (int32_t z = seg_z - 1; z >= 0; --z) {
+        const int32_t id = class_at(h, w, z);
+        if (id != free_index) {
+          lab = static_cast<uint8_t>(std::max(0, std::min(id, 255)));
+          break;
+        }
+      }
+      bev[static_cast<size_t>(h * seg_w + w)] = lab;
+    }
+  }
+
+  const int32_t out_h = std::max(resize_h, 1);
+  const int32_t out_w = std::max(resize_w, 1);
+  lidar_seg->num_classes = num_classes;
+  lidar_seg->height = out_h;
+  lidar_seg->width = out_w;
+  lidar_seg->seg.resize(static_cast<size_t>(out_h * out_w));
+  for (int32_t rh = 0; rh < out_h; ++rh) {
+    const int32_t sh = std::min(seg_h - 1, rh * seg_h / out_h);
+    for (int32_t rw = 0; rw < out_w; ++rw) {
+      const int32_t sw = std::min(seg_w - 1, rw * seg_w / out_w);
+      lidar_seg->seg[static_cast<size_t>(rh * out_w + rw)] =
+          bev[static_cast<size_t>(sh * seg_w + sw)];
+    }
   }
 }
 
@@ -498,8 +641,22 @@ int QATBevFusionMultitaskPostProcessMethod::InitFromJsonString(
   if (document.HasMember("occ_use_int32")) {
     occ_use_int32_ = document["occ_use_int32"].GetBool();
   }
-  if (document.HasMember("occ_skip_bev_2d")) {
-    occ_skip_bev_2d_ = document["occ_skip_bev_2d"].GetBool();
+  if (document.HasMember("occ_num_classes")) {
+    occ_num_classes_ = document["occ_num_classes"].GetInt();
+  }
+
+  if (document.HasMember("eval_output_dir")) {
+    eval_output_dir_ = document["eval_output_dir"].GetString();
+    EnsureDir(eval_output_dir_);
+    VLOG(EXAMPLE_SYSTEM) << "Multitask eval output dir: " << eval_output_dir_;
+  }
+
+  if (document.HasMember("eval_occ_prefix")) {
+    eval_occ_prefix_ = document["eval_occ_prefix"].GetString();
+  }
+
+  if (document.HasMember("eval_det_prefix")) {
+    eval_det_prefix_ = document["eval_det_prefix"].GetString();
   }
 
   if (document.HasMember("bev_range")) {
@@ -559,8 +716,7 @@ int QATBevFusionMultitaskPostProcessMethod::PostProcess(
 
   const int base = det_output_base_;
   const int occ_idx = occ_tensor_idx_;
-  if (base + 4 > static_cast<int>(tensors.size()) ||
-      occ_idx >= static_cast<int>(tensors.size()) || occ_idx < 0) {
+  if (base + 4 > static_cast<int>(tensors.size())) {
     VLOG(EXAMPLE_SYSTEM) << "Invalid tensor layout: outputs="
                          << tensors.size() << " det_base=" << base
                          << " occ_idx=" << occ_idx;
@@ -737,50 +893,61 @@ int QATBevFusionMultitaskPostProcessMethod::PostProcess(
         lb, scores[static_cast<size_t>(i)], labels[static_cast<size_t>(i)]});
   }
 
-  hbDNNTensor &occ_tensor = tensors[occ_idx];
-  uint32_t occ_rank = occ_tensor.properties.validShape.numDimensions;
-  const int32_t occ_type = occ_tensor.properties.tensorType;
-  const auto &occ_vs = occ_tensor.properties.validShape;
-  const bool occ_is_bpu_argmax = OccIsBpuArgmaxOutput(occ_tensor);
-  if (occ_is_bpu_argmax) {
-    VLOG(EXAMPLE_DEBUG) << "OCC output NDHW BPU argmax (rank=" << occ_rank
-                        << ", shape=" << occ_vs.dimensionSize[1] << "x"
-                        << occ_vs.dimensionSize[2] << "x"
-                        << occ_vs.dimensionSize[3] << ", type=" << occ_type
-                        << ").";
-    OccCopySeg3dNdhw(&occ_tensor, &perception->seg3d);
-    OccBuildLidarSegFromSeg3d(perception->seg3d, &perception->lidarSeg);
-  } else if (occ_rank >= 5U &&
-      (occ_tensor.properties.tensorType == HB_DNN_TENSOR_TYPE_S8 ||
-       occ_tensor.properties.tensorType == HB_DNN_TENSOR_TYPE_U8)) {
-    VLOG(EXAMPLE_DEBUG) << "OCC output NDHWC packed (rank=" << occ_rank
-                        << ", type=" << occ_tensor.properties.tensorType << ").";
-    OccArgmaxNdhwcPacked(&occ_tensor, &perception->seg3d, &perception->lidarSeg,
-                         occ_resize_height_, occ_resize_width_, occ_scale_height_,
-                         occ_scale_width_);
-  } else if (!occ_skip_bev_2d_ && occ_rank == 4U) {
-    // Legacy 2D BEV NHWC logits only; never treat NDHW BPU argmax as NHWC.
-    VLOG(EXAMPLE_SYSTEM)
-        << "OCC rank-4 tensor is not BPU argmax (type=" << occ_type
-        << "); refusing OccArgmaxNhwc to avoid mis-reading [N,H,W,Dz] as NHWC.";
+  const int resolved_occ_idx = ResolveOccTensorIdx(tensors, occ_idx);
+  if (resolved_occ_idx < 0 ||
+      resolved_occ_idx >= static_cast<int>(tensors.size())) {
+    VLOG(EXAMPLE_SYSTEM) << "No OCC output tensor. outputs="
+                         << tensors.size() << " occ_idx=" << occ_idx;
     perception->seg3d.seg.clear();
     perception->seg3d.h = perception->seg3d.w = perception->seg3d.z = 0;
-    perception->lidarSeg.seg.clear();
-    perception->lidarSeg.height = perception->lidarSeg.width = 0;
-  } else if (!occ_skip_bev_2d_) {
-    perception->seg3d.seg.clear();
-    perception->seg3d.h = perception->seg3d.w = perception->seg3d.z = 0;
-    OccArgmaxNhwc(&occ_tensor, &perception->lidarSeg, occ_resize_height_,
-                  occ_resize_width_, occ_scale_height_, occ_scale_width_,
-                  occ_use_int32_);
   } else {
-    VLOG(EXAMPLE_SYSTEM) << "Unexpected OCC tensor rank=" << occ_rank
-                         << " type=" << occ_tensor.properties.tensorType
-                         << "; expected 4D BPU argmax or 5D NDHWC logits.";
-    perception->seg3d.seg.clear();
-    perception->seg3d.h = perception->seg3d.w = perception->seg3d.z = 0;
-    perception->lidarSeg.seg.clear();
-    perception->lidarSeg.height = perception->lidarSeg.width = 0;
+    if (resolved_occ_idx != occ_idx) {
+      VLOG(EXAMPLE_SYSTEM) << "OCC tensor idx " << occ_idx
+                           << " is not a 200x200x16 grid; using index "
+                           << resolved_occ_idx;
+    }
+    for (size_t i = 0; i < tensors.size(); ++i) {
+      VLOG(EXAMPLE_DEBUG) << "output[" << i << "] "
+                          << OccTensorDesc(tensors[i]);
+    }
+
+    hbDNNTensor &occ_tensor = tensors[resolved_occ_idx];
+    VLOG(EXAMPLE_SYSTEM) << "OCC tensor idx=" << resolved_occ_idx << " "
+                         << OccTensorDesc(occ_tensor);
+
+    if (occ_tensor.properties.alignedByteSize <= 0 ||
+        occ_tensor.sysMem.virAddr == nullptr) {
+      VLOG(EXAMPLE_SYSTEM)
+          << "OCC output is empty (alignedByteSize=0). The HBM ArgMax node "
+             "was not mapped to BPU. Rebuild with quantized INT32 ArgMax "
+             "(no DeQuant / .to(int8) after argmax).";
+      perception->seg3d.seg.clear();
+      perception->seg3d.h = perception->seg3d.w = perception->seg3d.z = 0;
+    } else if (OccLooksLikeLogits(occ_tensor, occ_num_classes_)) {
+      VLOG(EXAMPLE_DEBUG) << "OCC logits NDHWC, CPU argmax.";
+      OccArgmaxNdhwcPacked(&occ_tensor, &perception->seg3d,
+                           &perception->lidarSeg, occ_resize_height_,
+                           occ_resize_width_, occ_scale_height_,
+                           occ_scale_width_);
+    } else if (InferOccClassIdLayout(occ_tensor).ok) {
+      VLOG(EXAMPLE_DEBUG) << "OCC class ids (BPU argmax).";
+      OccCopyNdhwClassIds(&occ_tensor, &perception->seg3d,
+                          &perception->lidarSeg, occ_resize_height_,
+                          occ_resize_width_, occ_num_classes_);
+    } else {
+      VLOG(EXAMPLE_SYSTEM)
+          << "OCC layout not 3D class-id / logits; fallback 2D.";
+      perception->seg3d.seg.clear();
+      perception->seg3d.h = perception->seg3d.w = perception->seg3d.z = 0;
+      OccArgmaxNhwc(&occ_tensor, &perception->lidarSeg, occ_resize_height_,
+                    occ_resize_width_, occ_scale_height_, occ_scale_width_,
+                    occ_use_int32_);
+    }
+  }
+
+  if (!eval_output_dir_.empty()) {
+    SaveOccPredBin(image_tensor, perception);
+    // SaveDetPredBin(image_tensor, perception);
   }
 
   const uint64_t post_us = Stopwatch::CurrentTs() - post_t0;
@@ -790,5 +957,154 @@ int QATBevFusionMultitaskPostProcessMethod::PostProcess(
                       << image_tensor->pre_duration / 1000.0 << " infer_ms="
                       << image_tensor->infer_duration / 1000.0 << " post_ms="
                       << post_us / 1000.0;
+  return 0;
+}
+
+int QATBevFusionMultitaskPostProcessMethod::SaveOccPredBin(
+    const ImageTensor *image_tensor, const Perception *perception) {
+  if (perception->seg3d.seg.empty() || perception->seg3d.h <= 0 ||
+      perception->seg3d.w <= 0 || perception->seg3d.z <= 0) {
+    VLOG(EXAMPLE_SYSTEM) << "Skip OCC pred bin: empty seg3d frame_id="
+                         << image_tensor->frame_id
+                         << " h=" << perception->seg3d.h
+                         << " w=" << perception->seg3d.w
+                         << " z=" << perception->seg3d.z
+                         << " elems=" << perception->seg3d.seg.size();
+    return -1;
+  }
+
+  const size_t elem_count = perception->seg3d.seg.size();
+  std::vector<int16_t> pred(elem_count);
+  for (size_t i = 0; i < elem_count; ++i) {
+    const int32_t label = static_cast<int32_t>(perception->seg3d.seg[i]);
+    pred[i] = static_cast<int16_t>(std::max(0, std::min(label, 32767)));
+  }
+
+  std::ostringstream oss;
+  oss << eval_output_dir_ << "/" << eval_occ_prefix_ << std::setw(6)
+      << std::setfill('0') << image_tensor->frame_id << ".bin";
+  std::ofstream ofs(oss.str(),
+                    std::ios::out | std::ios::binary | std::ios::trunc);
+  if (!ofs) {
+    VLOG(EXAMPLE_SYSTEM) << "Open OCC pred bin failed: " << oss.str();
+  } else {
+    ofs.write(reinterpret_cast<const char *>(pred.data()),
+              static_cast<std::streamsize>(pred.size() * sizeof(int16_t)));
+    VLOG(EXAMPLE_DEBUG) << "Saved OCC pred bin: " << oss.str()
+                        << " shape=[" << perception->seg3d.h << ","
+                        << perception->seg3d.w << ","
+                        << perception->seg3d.z << "] elems=" << elem_count;
+  }
+
+  if (image_tensor->frame_id == 0) {
+    std::string meta_path = eval_output_dir_ + "/meta_occ.json";
+    std::ofstream mf(meta_path);
+    if (mf) {
+      mf << "{\n"
+         << "  \"h\": " << perception->seg3d.h << ",\n"
+         << "  \"w\": " << perception->seg3d.w << ",\n"
+         << "  \"z\": " << perception->seg3d.z << ",\n"
+         << "  \"num_classes\": " << perception->seg3d.num_classes << ",\n"
+         << "  \"dtype\": \"int16\",\n"
+         << "  \"order\": \"HWZ_flattened\"\n"
+         << "}\n";
+    }
+  }
+
+  // // Save BEV segmentation (lidarSeg) if valid.
+  // if (!perception->lidarSeg.seg.empty() && perception->lidarSeg.height > 0 &&
+  //     perception->lidarSeg.width > 0) {
+  //   const size_t elem_count = perception->lidarSeg.seg.size();
+  //   std::vector<int16_t> pred(elem_count);
+  //   for (size_t i = 0; i < elem_count; ++i) {
+  //     pred[i] = static_cast<int16_t>(perception->lidarSeg.seg[i]);
+  //   }
+
+  //   std::ostringstream oss;
+  //   oss << eval_output_dir_ << "/" << eval_occ_prefix_ << "bev_"
+  //       << std::setw(6) << std::setfill('0') << image_tensor->frame_id
+  //       << ".bin";
+  //   std::ofstream ofs(oss.str(),
+  //                     std::ios::out | std::ios::binary | std::ios::trunc);
+  //   if (!ofs) {
+  //     VLOG(EXAMPLE_SYSTEM) << "Open BEV seg pred bin failed: " << oss.str();
+  //   } else {
+  //     ofs.write(reinterpret_cast<const char *>(pred.data()),
+  //               static_cast<std::streamsize>(pred.size() * sizeof(int16_t)));
+  //     VLOG(EXAMPLE_DEBUG) << "Saved BEV seg pred bin: " << oss.str()
+  //                         << " shape=[" << perception->lidarSeg.height << ","
+  //                         << perception->lidarSeg.width
+  //                         << "] elems=" << elem_count;
+  //   }
+
+  //   if (image_tensor->frame_id == 0) {
+  //     std::string meta_path = eval_output_dir_ + "/meta_bev.json";
+  //     std::ofstream mf(meta_path);
+  //     if (mf) {
+  //       mf << "{\n"
+  //          << "  \"height\": " << perception->lidarSeg.height << ",\n"
+  //          << "  \"width\": " << perception->lidarSeg.width << ",\n"
+  //          << "  \"num_classes\": " << perception->lidarSeg.num_classes << ",\n"
+  //          << "  \"dtype\": \"int16\",\n"
+  //          << "  \"order\": \"HW_flattened\"\n"
+  //          << "}\n";
+  //     }
+  //   }
+  // }
+
+  return 0;
+}
+
+int QATBevFusionMultitaskPostProcessMethod::SaveDetPredBin(
+    const ImageTensor *image_tensor, const Perception *perception) {
+  const auto &detections = perception->lidar3d;
+  if (detections.empty()) {
+    VLOG(EXAMPLE_DEBUG) << "No detections to save for frame_id="
+                        << image_tensor->frame_id;
+    return 0;
+  }
+
+  // Binary format: int32_t N, then N x { float score, int32_t label,
+  //   float cx, float cy, float cz, float w, float l, float h,
+  //   float rot, float vx, float vy }
+  const int32_t num_dets = static_cast<int32_t>(detections.size());
+  constexpr int32_t kFloatsPerDet = 9;
+  const size_t header_sz = sizeof(int32_t);
+  const size_t body_sz =
+      static_cast<size_t>(num_dets) *
+      (sizeof(float) + sizeof(int32_t) + kFloatsPerDet * sizeof(float));
+  std::vector<char> buf(header_sz + body_sz);
+
+  *reinterpret_cast<int32_t *>(buf.data()) = num_dets;
+  char *ptr = buf.data() + header_sz;
+  for (const auto &det : detections) {
+    *reinterpret_cast<float *>(ptr) = det.score;
+    ptr += sizeof(float);
+    *reinterpret_cast<int32_t *>(ptr) = det.label;
+    ptr += sizeof(int32_t);
+    const auto &b = det.bbox;
+    float feats[kFloatsPerDet] = {b.xs,    b.ys,     b.height, b.dim_0,
+                                   b.dim_1, b.dim_2,  b.rot,    b.vel_0,
+                                   b.vel_1};
+    std::memcpy(ptr, feats, sizeof(feats));
+    ptr += sizeof(feats);
+  }
+
+  std::ostringstream oss;
+  oss << eval_output_dir_ << "/" << eval_det_prefix_ << std::setw(6)
+      << std::setfill('0') << image_tensor->frame_id << ".bin";
+  std::ofstream ofs(oss.str(),
+                    std::ios::out | std::ios::binary | std::ios::trunc);
+  if (!ofs) {
+    VLOG(EXAMPLE_SYSTEM) << "Open det pred bin failed: " << oss.str();
+    return -1;
+  }
+  ofs.write(buf.data(), static_cast<std::streamsize>(buf.size()));
+  if (!ofs) {
+    VLOG(EXAMPLE_SYSTEM) << "Write det pred bin failed: " << oss.str();
+    return -1;
+  }
+  VLOG(EXAMPLE_DEBUG) << "Saved det pred bin: " << oss.str()
+                      << " num_dets=" << num_dets;
   return 0;
 }

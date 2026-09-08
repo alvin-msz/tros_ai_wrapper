@@ -22,8 +22,9 @@
  * lidarSeg) for raw_output multitask logging.
  *
  * Tensor layout defaults follow QATBevformerPostProcessMethod (det: base..base+3)
- * plus one OCC tensor at occ_tensor_idx (NDHW INT32 after BPU argmax, or
- * NDHWC int8 logits for legacy graphs).
+ * plus one OCC tensor at occ_tensor_idx (auto-resolved if that slot is empty):
+ *   rank 5 [N,H,W,Dz,C] C==num_classes — logits, CPU argmax
+ *   rank 4/3 class ids (BPU ArgMax, typically INT32 [N,H,W,Dz])
  */
 class QATBevFusionMultitaskPostProcessMethod : public PostProcessMethod {
  public:
@@ -37,6 +38,10 @@ class QATBevFusionMultitaskPostProcessMethod : public PostProcessMethod {
  private:
   int PostProcess(std::vector<hbDNNTensor> &tensors, ImageTensor *image_tensor,
                   Perception *perception);
+  int SaveOccPredBin(const ImageTensor *image_tensor,
+                     const Perception *perception);
+  int SaveDetPredBin(const ImageTensor *image_tensor,
+                     const Perception *perception);
 
   int topk_{300};
   float score_threshold_{0.1f};
@@ -54,8 +59,12 @@ class QATBevFusionMultitaskPostProcessMethod : public PostProcessMethod {
   float occ_scale_height_{0.f};
   float occ_scale_width_{0.f};
   bool occ_use_int32_{false};
-  /** When true, skip BEV 2D upsample path (use with BPU argmax 4D output). */
-  bool occ_skip_bev_2d_{true};
+  int occ_num_classes_{18};
+
+  /// Optional output directory for eval bin export.
+  std::string eval_output_dir_;
+  std::string eval_occ_prefix_{"occ_rank0_"};
+  std::string eval_det_prefix_{"det_rank0_"};
 };
 
 #endif  // DNN_AI_BENCHMARK_CODE_INCLUDE_METHOD_QAT_BEVFUSION_MULTITASK_POST_PROCESS_METHOD_H_

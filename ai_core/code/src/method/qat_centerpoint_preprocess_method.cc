@@ -45,11 +45,12 @@ int32_t QATCenterPointPreProcessMethod::InitFromJsonString(
 
   rapidjson::Document document;
   document.Parse(config.data());
+
   if (document.HasParseError()) {
     VLOG(EXAMPLE_SYSTEM) << "Parsing config file failed";
     return -1;
   }
-  
+
   float back = document["back"].GetFloat();
 
   float front = document["front"].GetFloat();
@@ -82,7 +83,7 @@ int32_t QATCenterPointPreProcessMethod::InitFromJsonString(
   if (document.HasMember("run_on_dsp")) {
     run_on_dsp = document["run_on_dsp"].GetBool();
   }
-  
+
   config_ =
       new VoxelConfig(back, front, right, left, bottom, top, r_lower, r_upper,
                       x_scale, y_scale, max_num_point_pillar, max_num_point,
@@ -511,6 +512,9 @@ int32_t QATCenterPointPreProcessMethod::DoProcess(std::string path,
   tensors.resize(input_count);
 
   for (int i = 0; i < input_count; i++) {
+    // if (tensors[i].sysMem.virAddr != nullptr) {
+    //   release_tensor(&tensors[i]);
+    // }
     hbDNNGetInputTensorProperties(&(tensors[i].properties), dnn_handle_, i);
     int aligned_size = tensors[i].properties.alignedByteSize;
     hbUCPMallocCached(&(tensors[i].sysMem), aligned_size, 0);

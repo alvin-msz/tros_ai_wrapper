@@ -1,0 +1,16 @@
+{
+  "topk": 300,
+  "score_threshold": 0.1,
+  "det_output_base": 0,
+  "occ_tensor_idx": 4,
+  "occ_resize_height": 512,
+  "occ_resize_width": 512,
+  "occ_scale_height": 0,
+  "occ_scale_width": 0,
+  "occ_use_int32": false,
+  "occ_skip_bev_2d": true,
+  "bev_range": [-40.0, -40.0, -1.8, 40.0, 40.0, 6.2],
+  "post_center_range": [-50.0, -50.0, -10.0, 50.0, 50.0, 10.0],
+  "ori_shape": [900, 1600],
+  "resize_shape": [512, 960]
+}
